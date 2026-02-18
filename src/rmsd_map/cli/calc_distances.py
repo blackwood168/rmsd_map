@@ -16,6 +16,8 @@ def main():
     parser.add_argument('input_file', type=Path, help='Input COR file')
     parser.add_argument('-o', '--output', type=str, default='distance_matrix',
                         help='Output file prefix (default: distance_matrix)')
+    parser.add_argument('-p', '--proper_only', action='store_true',
+                        help='Don\'t allow improper rotations in overlap'),
     parser.add_argument('-b', '--batch-size', type=int, default=200000,
                         help='Batch size for calculations (default: 200000)')
     parser.add_argument('-r', '--report-interval', type=int, default=5,
@@ -32,7 +34,9 @@ def main():
     print(f"Set up a calculation with {NFrags} fragments, {perms.shape[1]} atoms and {perms.shape[0]} symmetries")
     print(f"{now()}: Starting distance calculations")
 
-    mat, df = ppl.distance_matrix_fragments(fragments, args.batch_size, args.report_interval )
+    print(args.proper_only)
+
+    mat, df = ppl.distance_matrix_fragments(fragments, args.batch_size, args.report_interval, allow_improper = not(args.proper_only) )
 
     print(f"Saving data")
     print(f"{now()}: Saving DataFrame")

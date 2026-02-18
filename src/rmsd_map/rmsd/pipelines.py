@@ -9,7 +9,12 @@ from rmsd_map.rmsd.kabsch_jax import calculate_pairs, kabsch_full_proper, kabsch
 def distance_matrix_stream(coords,
                            perm,
                            batch_size,
-                           report_spacing):
+                           report_spacing,
+                           allow_improper = True):
+    if allow_improper:
+        core = kabsch_rmsd_improp
+    else:
+        core = kabsch_full_proper
     AB = jax.device_put(coords) # AB: (M, N, 3)
     perm_d  = jax.device_put(perm)
     AB = AB - AB.mean(axis=1, keepdims=True)
@@ -17,18 +22,18 @@ def distance_matrix_stream(coords,
     T = M * (M-1) // 2
     pairs = triu_gen_batched(M, 1, batch_size)
     logger = Reporter(T, report_spacing)
-    for jax_dict in calculate_pairs(AB, perm_d, pairs, kabsch_rmsd_improp, logger):
+    for jax_dict in calculate_pairs(AB, perm_d, pairs, core, logger):
         np_dict = {k:np.asarray(v) for k,v in jax_dict.items()}
         yield np_dict
 
-def distance_matrix_fragments(fragments, batch_size, report_spacing):
+def distance_matrix_fragments(fragments, batch_size, report_spacing, allow_improper = True):
     NFrags = len(fragments)
     names = np.array([a.id for a in fragments])
     coords_np = np.stack([f.coords for f in fragments], axis=0)
     perms = fragments[0].perms()
     dfs = []
     mat = np.zeros((NFrags, NFrags), dtype=float)
-    for batch in distance_matrix_stream(coords_np, perms, batch_size, report_spacing):
+    for batch in distance_matrix_stream(coords_np, perms, batch_size, report_spacing, allow_improper):
        i = batch["i"]
        j = batch["j"]
        rmsd  = batch["RMSD"]
