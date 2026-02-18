@@ -19,11 +19,11 @@ classifiers     = [
 ]
 
 dependencies = [
-  "numpy>=1.23",
+  "numpy",
   "jax>=0.4.20",
-  "polars>=0.20",
-  "rdkit>=2023.09.1",
-  "umap-learn>=0.5",
+  "polars",
+  "rdkit",
+  "umap-learn",
   "matplotlib",
   "datashader",
   "pyarrow",
