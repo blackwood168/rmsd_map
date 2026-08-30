@@ -21,7 +21,9 @@ def make_umap_df(neighbors, distances, densmap=False, seed=42):
                    n_neighbors=neighbors,
                    densmap=densmap,
                    random_state=seed,
-                   n_jobs=1)
+                   n_jobs=1,
+                   min_dist = 0.0001
+                   )
     reducer.fit(distances)
     df = pl.DataFrame(reducer.embedding_, schema=["X", "Y"])
     df = df.with_columns(pl.lit(neighbors).alias("N"))
