@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import math
+import os
 
 import datashader as ds
 from datashader.mpl_ext import dsshow
@@ -22,6 +23,7 @@ def make_umap_df(neighbors, distances, densmap=False, seed=42):
                    densmap=densmap,
                    random_state=seed,
                    n_jobs=1,
+                   init='random' if len(distances) == 3 else 'spectral',
                    min_dist = 0.0001
                    )
     reducer.fit(distances)
@@ -30,32 +32,37 @@ def make_umap_df(neighbors, distances, densmap=False, seed=42):
     return df
 
 def read_distances_npz(npz_file):
-    with np.load(npz_file) as data:
-        names = data['names']
-        distances = data["distances"]
-    max_dist = np.nanmax(distances)
-    nans = np.isnan(distances)
-    nans_sum = np.sum(nans)
-    if nans_sum > 0:
-        print(f'There are {nans_sum} NaNs in the data matrix!')
-        print(np.where(nans))
-    nan_i, nan_j = np.where(nans)
-    distances[nan_i, nan_j] = max_dist
+    archive = np.load(npz_file, allow_pickle=False)
+    if not isinstance(archive, np.lib.npyio.NpzFile):
+        raise ValueError("Expected an NPZ archive with fields 'names' and 'distances'")
+    fields = {}
+    with archive:
+        for field in ("names", "distances"):
+            try:
+                fields[field] = archive[field]
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"Invalid or missing NPZ field '{field}': {exc}") from exc
+
+    names = fields["names"]
+    distances = fields["distances"]
+    if distances.ndim != 2 or not len(distances) or distances.shape[0] != distances.shape[1]:
+        raise ValueError("NPZ field 'distances' must be a nonempty square matrix")
+    if names.shape != (len(distances),):
+        raise ValueError("NPZ field 'names' must contain one ID per row of 'distances'")
+    if distances.dtype.kind not in "fiu" or not np.isfinite(distances).all():
+        raise ValueError("NPZ field 'distances' must contain finite real numbers")
+    if (distances < 0).any() or np.any(distances.diagonal() != 0):
+        raise ValueError("NPZ field 'distances' must be nonnegative with a zero diagonal")
+    if not np.array_equal(distances, distances.T):
+        raise ValueError("NPZ field 'distances' must be symmetric")
     return names, distances
 
 
 def generate_n_neighbors_list(max_neighbors: int = 500,
                               min_neighbors: int = 4):
-    neighbors_list = []
-    # Small values: < 10
-    neighbors_list.extend(range(min_neighbors, min(10, max_neighbors)))
-    # Medium values: 10-90 by 10s
-    if max_neighbors >= 10:
-        neighbors_list.extend(range(10, min(100, max_neighbors), 10))
-    # Large values: 100-max_neighbors by 50s
-    if max_neighbors >= 100:
-        neighbors_list.extend(range(100, max_neighbors + 1, 50))
-    return neighbors_list
+    # Both requested bounds are inclusive. Keep the same grid across runs.
+    candidates = [*range(2, 10), *range(10, 100, 10), *range(100, max_neighbors + 1, 50)]
+    return [value for value in candidates if min_neighbors <= value <= max_neighbors]
 
 def plot_umap_pages(df, output_file, grid_W = 2, grid_H = 3,
                     fig_W = 600, fig_H = 600,
@@ -96,7 +103,7 @@ def main():
                         help='Input NPZ file with distance matrix')
     parser.add_argument('-o', '--output-prefix', type=str, default='umap_results',
                         help='Output file prefix for CSV and PDF files')
-    parser.add_argument('-d', '--densmap', action='store_false',
+    parser.add_argument('-d', '--densmap', action='store_true',
                         help='Use densmap variant of UMAP'),
     parser.add_argument('-s', '--seed', type = int, default=42,
                         help='Random seed for reproducible UMAP runs')
@@ -112,22 +119,35 @@ def main():
 
     args = parser.parse_args()
 
-    _, distances = read_distances_npz(args.input_file)
-    N_MOLS = distances.shape[0]
+    try:
+        names, distances = read_distances_npz(args.input_file)
+    except (OSError, ValueError) as exc:
+        parser.error(f"{args.input_file}: {exc}")
+    count = len(names)
+    if count < 3:
+        parser.error("UMAP needs at least three fragments")
 
-    if args.neighbors:
-        N_NEIGHBORS_LIST = args.neighbors
+    if args.neighbors is not None:
+        neighbors_list = args.neighbors
+        if any(not 2 <= value < count for value in neighbors_list):
+            parser.error(f"--neighbors values must be between 2 and {count - 1}")
+        if len(neighbors_list) != len(set(neighbors_list)):
+            parser.error("--neighbors must not contain duplicate values")
     else:
-        N_NEIGHBORS_LIST = generate_n_neighbors_list(min(args.max_neighbors, N_MOLS // 2),
-                                                     args.min_neighbors)
+        if not 2 <= args.min_neighbors <= args.max_neighbors:
+            parser.error("Expected 2 <= --min-neighbors <= --max-neighbors")
+        neighbors_list = generate_n_neighbors_list(
+            min(args.max_neighbors, count // 2), args.min_neighbors)
+        if not neighbors_list:
+            parser.error("No automatic n_neighbors values for this dataset and bounds; "
+                         "supply an explicit list with --neighbors")
 
-    dfs =[]
-    with mp.Pool() as pool:
-        runner = partial(make_umap_df, distances=distances, densmap=args.densmap, seed=args.seed)
-        dfs = pool.map(runner, N_NEIGHBORS_LIST)
-#    for N in N_NEIGHBORS_LIST:
-#        dfs.append(make_umap_df(distances, N, densmap=args.densmap, seed=args.seed))
-    data = pl.concat(dfs, how = "vertical")
+    print(f"Computing UMAP for n_neighbors={neighbors_list}")
+    runner = partial(make_umap_df, distances=distances, densmap=args.densmap, seed=args.seed)
+    with mp.Pool(processes=min(len(neighbors_list), os.cpu_count() or 1)) as pool:
+        dfs = pool.map(runner, neighbors_list)
+    ids = pl.Series("ID", names)
+    data = pl.concat([df.with_columns(ids) for df in dfs], how="vertical")
     data.write_csv(f'{args.output_prefix}.csv')
     plot_umap_pages(data, f'{args.output_prefix}.pdf')
 

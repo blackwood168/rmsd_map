@@ -25,18 +25,16 @@ def main():
     args = parser.parse_args()
 
     print(f"{now()}: Reading and preparing data")
-    fragments = read_cor_file(str(args.input_file))
-    NFrags = len(fragments)
-
-    names = np.array([a.id for a in fragments])
-    perms = fragments[0].perms()
-
-    print(f"Set up a calculation with {NFrags} fragments, {perms.shape[1]} atoms and {perms.shape[0]} symmetries")
-    print(f"{now()}: Starting distance calculations")
-
-    print(args.proper_only)
-
-    mat, df = ppl.distance_matrix_fragments(fragments, args.batch_size, args.report_interval, allow_improper = not(args.proper_only) )
+    try:
+        fragments = read_cor_file(args.input_file)
+        print(f"{now()}: Starting distance calculations for {len(fragments)} fragments")
+        mat, df = ppl.distance_matrix_fragments(
+            fragments, args.batch_size, args.report_interval,
+            allow_improper=not args.proper_only,
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    names = np.array([fragment.id for fragment in fragments])
 
     print(f"Saving data")
     print(f"{now()}: Saving DataFrame")

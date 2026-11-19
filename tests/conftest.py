@@ -4,13 +4,7 @@ import pytest
 import numpy as np
 import jax
 from pathlib import Path
-from typing import List
-import sys
-
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from mol_io.cor_reader import Fragment
+from rmsd_map.mol_io.fragment import Fragment
 
 # Configure JAX for testing
 jax.config.update('jax_enable_x64', False)  # Use float32 for speed
@@ -31,8 +25,7 @@ def simple_fragment():
             [0.0, 0.0, 0.0],
             [0.757, 0.586, 0.0],
             [-0.757, 0.586, 0.0]
-        ], dtype=np.float32),
-        codes=np.array([1, 2, 3], dtype=np.int32)
+        ], dtype=np.float32)
     )
 
 @pytest.fixture
@@ -47,8 +40,7 @@ def benzene_fragment():
     return Fragment(
         id="BENZENE",
         elements=np.array(['C']*6, dtype='U2'),
-        coords=coords.astype(np.float32),
-        codes=np.arange(1, 7, dtype=np.int32)
+        coords=coords.astype(np.float32)
     )
 
 @pytest.fixture

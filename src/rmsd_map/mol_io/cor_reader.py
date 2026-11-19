@@ -1,59 +1,77 @@
-import numpy as np
 import re
 from typing import List
+
+import numpy as np
+from rdkit import Chem
+
 from rmsd_map.mol_io.fragment import Fragment
 
 ELEMENT_PATTERN = re.compile(r'^([A-Z][a-z]?)')
+HEADER_PATTERN = re.compile(r'^(?P<refcode>\S+)\s*\*\*FRAG\*\*\s*\S+(?:\s|$)')
+PERIODIC_TABLE = Chem.GetPeriodicTable()
+ELEMENTS = frozenset(PERIODIC_TABLE.GetElementSymbol(i) for i in range(1, 119))
+
 
 def extract_element(atom_name: str) -> str:
-    """Extract element symbol from atom name like 'C21', 'O1%', etc."""
+    """Extract an element symbol from an atom name such as C21 or O1%."""
     match = ELEMENT_PATTERN.match(atom_name)
     if match:
         return match.group(1)
-    # Fallback for weird cases
-    return atom_name[:2].strip()
+    return "" if atom_name.isdecimal() else atom_name[:2].strip()
+
 
 def read_cor_file(filename: str) -> List[Fragment]:
-    with open(filename, 'r') as f:
-        lines = [line.strip() for line in f if line.strip()]
-
     fragments = []
-    i = 0
+    frag_id = None
+    header_line = None
+    elements = []
+    coords = []
 
-    while i < len(lines):
-        if '**FRAG**' in lines[i]:
-            # Parse header
-            p = r'[ \*]+'
-            head = re.split(p, lines[i])
-            frag_id = head[0] + "_" + head[2]
-            i += 1
+    def finish_fragment():
+        if not coords:
+            raise ValueError(f"{filename}:{header_line}: fragment {frag_id} has no atoms")
+        fragments.append(Fragment(frag_id, np.asarray(elements, dtype="U2"),
+                                  np.asarray(coords, dtype=np.float32)))
 
-            # Find extent of this fragment
-            start = i
-            while i < len(lines) and '**FRAG**' not in lines[i]:
-                i += 1
+    with open(filename) as cor_file:
+        for line_number, line in enumerate(cor_file, start=1):
+            line = line.strip()
+            if not line:
+                continue
 
-            # Parse atom block in one go
-            atom_lines = lines[start:i]
-            if atom_lines:
-                # Pre-allocate arrays
-                n_atoms = len(atom_lines)
-                elements = np.empty(n_atoms, dtype='U2')
-                coords = np.empty((n_atoms, 3), dtype=np.float32)
-                codes = np.empty(n_atoms, dtype=np.int32)
+            if "**FRAG**" in line:
+                match = HEADER_PATTERN.match(line)
+                if not match:
+                    raise ValueError(f"{filename}:{line_number}: invalid **FRAG** header")
+                if frag_id is not None:
+                    finish_fragment()
+                frag_id = match["refcode"]
+                header_line = line_number
+                elements = []
+                coords = []
+                continue
 
-                # Parse all at once
-                for j, line in enumerate(atom_lines):
-                    parts = line.split()
-                    elements[j] = extract_element(parts[0])
-                    coords[j] = parts[1:4]
-                
-                fragments.append(Fragment(
-                    id=frag_id,
-                    elements=elements,
-                    coords=coords,
-                ))
-        else:
-            i += 1
+            if frag_id is None:
+                continue
+
+            location = f"{filename}:{line_number}: fragment {frag_id}"
+            fields = line.split()
+            if len(fields) < 4:
+                raise ValueError(f"{location}: expected an atom label and three coordinates")
+            element = extract_element(fields[0])
+            if element not in ELEMENTS:
+                raise ValueError(f"{location}: invalid element in atom label {fields[0]!r}")
+            try:
+                with np.errstate(over="ignore"):
+                    xyz = np.asarray(fields[1:4], dtype=np.float32)
+            except ValueError as exc:
+                raise ValueError(f"{location}: expected three numeric coordinates") from exc
+            if not np.isfinite(xyz).all():
+                raise ValueError(f"{location}: coordinates must be finite float32 values")
+            elements.append(element)
+            coords.append(xyz)
+
+    if frag_id is not None:
+        finish_fragment()
 
     return fragments

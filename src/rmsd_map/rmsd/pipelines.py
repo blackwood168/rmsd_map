@@ -3,14 +3,32 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import polars as pl
-from rmsd_map.mol_io.fragment import Fragment
 from rmsd_map.rmsd.kabsch_jax import calculate_pairs, kabsch_full_proper, kabsch_full_improp, kabsch_rmsd_improp, Reporter
+
+def _stack_fragment_coords(fragments):
+    if len(fragments) == 0:
+        raise ValueError("No fragments to compare")
+    first = fragments[0]
+    for fragment in fragments:
+        if len(fragment.elements) != len(first.elements):
+            raise ValueError(
+                f"Fragment {fragment.id} has {len(fragment.elements)} atoms, "
+                f"expected {len(first.elements)} as in {first.id}"
+            )
+        if not np.array_equal(fragment.elements, first.elements):
+            raise ValueError(f"Fragment {fragment.id} has a different element order from {first.id}")
+        if not len(fragment.elements) or np.shape(fragment.coords) != (len(fragment.elements), 3):
+            raise ValueError(f"Fragment {fragment.id} must have one XYZ row per atom and at least one atom")
+    return np.stack([fragment.coords for fragment in fragments])
+
 
 def distance_matrix_stream(coords,
                            perm,
                            batch_size,
                            report_spacing,
                            allow_improper = True):
+    if batch_size <= 0 or report_spacing <= 0:
+        raise ValueError("Batch size and report interval must be positive")
     if allow_improper:
         core = kabsch_rmsd_improp
     else:
@@ -26,13 +44,17 @@ def distance_matrix_stream(coords,
         np_dict = {k:np.asarray(v) for k,v in jax_dict.items()}
         yield np_dict
 
-def distance_matrix_fragments(fragments, batch_size, report_spacing, allow_improper = True):
-    NFrags = len(fragments)
-    names = np.array([a.id for a in fragments])
-    coords_np = np.stack([f.coords for f in fragments], axis=0)
+def distance_matrix_fragments(fragments, batch_size, report_spacing, allow_improper=True):
+    if batch_size <= 0 or report_spacing <= 0:
+        raise ValueError("Batch size and report interval must be positive")
+    coords_np = _stack_fragment_coords(fragments)
+    names = np.array([fragment.id for fragment in fragments])
+    mat = np.zeros((len(fragments), len(fragments)), dtype=float)
+    if len(fragments) == 1:
+        return mat, pl.DataFrame(schema={"ID_A": pl.String, "ID_B": pl.String, "Dist": pl.Float32})
+
     perms = fragments[0].perms()
     dfs = []
-    mat = np.zeros((NFrags, NFrags), dtype=float)
     for batch in distance_matrix_stream(coords_np, perms, batch_size, report_spacing, allow_improper):
        i = batch["i"]
        j = batch["j"]
@@ -64,29 +86,28 @@ def align_stream(coords,
         yield np_dict
 
 def align_fragments(fragments, n_center=0, batch_size=4096):
+    coords_np = _stack_fragment_coords(fragments)
     perms = fragments[n_center].perms()
-    coords_np = np.stack([f.coords for f in fragments], axis=0)
     fragments_aligned = []
     for batch in align_stream(coords_np, perms, center=n_center, batch_size=batch_size):
-        for i in batch["i"]:
-            fragment = fragments[i].replace(coords = batch["Transformed"][i])
-            fragments_aligned.append(fragment)
+        for i, transformed in zip(batch["i"], batch["Transformed"]):
+            fragments_aligned.append(fragments[i].replace(coords=transformed))
     return np.asarray(fragments_aligned, dtype=object)
 
 
 def partial_align_fragments(fragments, subset_idx, n_center=0, batch_size=4096):
-    perms = np.expand_dims(np.arange(len(subset_idx)), axis=0)
-    coords_np = np.stack([f.coords[subset_idx] for f in fragments], axis=0)
-    mean_reduced = coords_np.mean(axis = 1)
-    fragments_aligned = np.zeros_like(fragments)
-    for batch in align_stream(coords_np, perms, center=n_center,
+    coords_np = _stack_fragment_coords(fragments)
+    subset = coords_np[:, subset_idx, :]
+    if subset.ndim != 3 or subset.shape[1] == 0:
+        raise ValueError("Select a nonempty, one-dimensional subset of atoms")
+    perms = np.arange(subset.shape[1])[None, :]
+    mean_reduced = subset.mean(axis=1)
+    fragments_aligned = np.empty(len(fragments), dtype=object)
+    for batch in align_stream(subset, perms, center=n_center,
                               batch_size=batch_size, rmsd_kernel=kabsch_full_proper):
-        for i in batch["i"]:
-            rot = np.asarray(batch['Rotation'][i])
-            coords_new = fragments[i].coords - mean_reduced[i]
-            coords_new =  np.einsum("ji,nj->ni", rot, coords_new)
-            fragment = fragments[i].replace(coords = coords_new)
-            fragments_aligned[i] = fragment
+        for i, rot in zip(batch["i"], batch["Rotation"]):
+            coords_new = (coords_np[i] - mean_reduced[i]) @ rot
+            fragments_aligned[i] = fragments[i].replace(coords=coords_new)
     return fragments_aligned
 
 def triu_gen_batched(M, k, batch_size):
@@ -105,45 +126,46 @@ def triu_gen_batched(M, k, batch_size):
         yield (jnp.array(rows, dtype=jnp.int32), jnp.array(cols, dtype=jnp.int32))
 
 def align_gen_batched(M, center, batch_size):
-    split_by = jnp.maximum(1, M // batch_size)
-    ii = jnp.array_split(
-        jnp.arange(M, dtype=jnp.int32),
-        split_by)
-    for i in ii:
-        j = jnp.repeat(center, i.shape[0]).astype(jnp.int32)
-        yield (i, j)
+    if batch_size <= 0:
+        raise ValueError("Batch size must be positive")
+    for start in range(0, M, batch_size):
+        stop = min(start + batch_size, M)
+        yield (jnp.arange(start, stop, dtype=jnp.int32),
+               jnp.full(stop - start, center, dtype=jnp.int32))
+
+
+def _align_chain_step(current, previous, perms):
+    return kabsch_full_improp(current[None], previous[None], perms)["Transformed"][0]
 
 
 def chain_fragments_naive(fragments):
-    M = len(fragments)
-    coords_np = np.stack([f.coords for f in fragments], axis=0)
-    AB_old = jax.device_put(coords_np)
-    AB_new = jnp.zeros(AB_old.shape, dtype = AB_old.dtype)
-    AB_new = AB_new.at[0].set(AB_old[0])
+    """Fit each frame to its predecessor in the coordinate system of the first frame."""
+    coords = jax.device_put(_stack_fragment_coords(fragments))
+    centers = coords.mean(axis=1, keepdims=True)
+    centered = coords - centers
     perms = jax.device_put(fragments[0].perms())
-    new_fragments = np.empty(len(fragments), dtype = "object")
-    new_fragments[0] = fragments[0]
-    for i in jnp.arange(1, M):
-        A = AB_new[i - 1:i]  # Add batch dimension: (1, N, 3)
-        B = AB_old[i:i+1]    # Add batch dimension: (1, N, 3)
-        r = kabsch_full_improp(A, B, perms)['Transformed']
-        AB_new = AB_new.at[i].set(r[0])     # Remove batch dimension: (N, 3)
-        new_fragments[i] = fragments[i].replace(coords = np.asarray(r[0]))
-    return new_fragments
+    previous = centered[0]
+    aligned = [fragments[0]]
+    for i in range(1, len(fragments)):
+        previous = _align_chain_step(centered[i], previous, perms)
+        aligned.append(fragments[i].replace(coords=np.asarray(previous + centers[0])))
+    return np.asarray(aligned, dtype=object)
 
 
 def chain_fragments(fragments):
-    M = len(fragments)
-    coords_np = np.stack([f.coords for f in fragments], axis=0)
-    AB_old = jax.device_put(coords_np)
+    """Fit sequential frames in the coordinate system of the first frame using JAX scan."""
+    coords = jax.device_put(_stack_fragment_coords(fragments))
+    if len(fragments) == 1:
+        return np.asarray(fragments, dtype=object)
+    centers = coords.mean(axis=1, keepdims=True)
+    centered = coords - centers
     perms = jax.device_put(fragments[0].perms())
-    def next(carry, x):
-        A = jnp.expand_dims(x, 0)
-        B = jnp.expand_dims(carry, 0)
-        r = kabsch_full_improp(A, B, perms)['Transformed'][0]
-        return (r, r)
-    _, AB_new = jax.lax.scan(next, AB_old[0], AB_old)
-    new_fragments = np.empty(len(fragments), dtype = "object")
-    for i in jnp.arange(M):
-        new_fragments[i] = fragments[i].replace(coords = np.asarray(AB_new[i]))
-    return new_fragments
+
+    def next_frame(previous, current):
+        aligned = _align_chain_step(current, previous, perms)
+        return aligned, aligned
+
+    _, aligned = jax.lax.scan(next_frame, centered[0], centered[1:])
+    aligned = np.asarray(aligned + centers[0])
+    return np.asarray([fragments[0], *(fragment.replace(coords=xyz)
+                       for fragment, xyz in zip(fragments[1:], aligned))], dtype=object)

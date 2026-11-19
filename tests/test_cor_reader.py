@@ -2,7 +2,7 @@
 
 import pytest
 import numpy as np
-from mol_io.cor_reader import read_cor_file, extract_element, Fragment
+from rmsd_map.mol_io.cor_reader import read_cor_file, extract_element
 
 class TestElementExtraction:
     """Test element symbol extraction from atom names"""
@@ -60,13 +60,17 @@ class TestCORReader:
         fragments = read_cor_file(str(empty_file))
         assert len(fragments) == 0
 
-    def test_read_malformed_cor(self, tmp_path):
+    @pytest.mark.parametrize("atom_line,reason", [
+        ("C1 1.0 2.0", "expected an atom label and three coordinates"),
+        ("C1 1.0 2.0 invalid", "expected three numeric coordinates"),
+        ("C1 nan 2.0 3.0", "coordinates must be finite"),
+        ("C1 1e90 2.0 3.0", "coordinates must be finite"),
+        ("123 1.0 2.0 3.0", "invalid element"),
+        ("Xx1 1.0 2.0 3.0", "invalid element"),
+    ])
+    def test_read_malformed_cor(self, tmp_path, atom_line, reason):
         malformed = tmp_path / "malformed.cor"
-        malformed.write_text("""BROKEN  **FRAG**  1
-Not enough columns
-C1 1.0 2.0  # Missing coordinate
-""")
-        fragments = read_cor_file(str(malformed))
-        # Should handle gracefully, return what it can parse
-        assert len(fragments) == 1
-        assert len(fragments[0].elements) == 0  # No valid atoms
+        malformed.write_text(f"BROKEN  **FRAG**  1\n\n{atom_line}\n")
+        with pytest.raises(ValueError, match=reason) as error:
+            read_cor_file(malformed)
+        assert f"{malformed}:3: fragment BROKEN:" in str(error.value)

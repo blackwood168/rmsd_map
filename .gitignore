@@ -21,6 +21,7 @@ wheels/
 *.egg
 MANIFEST
 .venv
+/.conda/
 
 # Testing
 .pytest_cache/

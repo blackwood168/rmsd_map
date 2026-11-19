@@ -35,7 +35,7 @@ class Fragment:
 
     def perms(self):
         mol = self.mol()
-        ts =  mol.GetSubstructMatches(mol, uniquify = False)
+        ts = mol.GetSubstructMatches(mol, uniquify = False, maxMatches = 5000)
         self._perms = np.array(ts)
         return self._perms
 
